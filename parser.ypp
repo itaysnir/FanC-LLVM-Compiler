@@ -1,0 +1,1647 @@
+%{
+// C declarations
+extern int yylineno;
+extern int yylex();
+void yyerror(char const* message);
+#include <iostream>
+#include <string>
+#include <vector>
+#include <cstdint>
+#include <algorithm>
+#include "output.hpp"
+#include "symbol_table.hpp"
+#include "parser.hpp"
+#include "bp.hpp"
+#define YYERROR_VERBOSE 1
+#define YYSTYPE Node*
+std::vector<SymbolTable> table_stack;
+std::vector<offset_entry_t> offset_stack;
+std::string return_type;
+std::vector<TableEntry> args_entries;
+std::vector<std::string> curr_func_args_types;
+std::vector<std::string> curr_func_args_places;
+std::vector<int> curr_func_args_values;
+std::string global_id_sym;
+std::string current_func_name;
+int current_register_num = 0;
+std::vector<std::pair<std::string, std::string>> allocated_strings;
+std::string else_label;
+int else_location;
+std::string while_label;
+int while_location;
+Node* most_recent_exp = new Node();
+std::string find_symbol_type(std::vector<SymbolTable>& table_stack, const std::string& name);
+TableEntry get_function(std::vector<SymbolTable>& table_stack, const std::string& name);
+TableEntry get_entry(std::vector<SymbolTable>& table_stack, const std::string& name);
+void print_end_scope(std::vector<SymbolTable>& table_stack);
+void print_all_scopes(std::vector<SymbolTable>& table_stack);
+bool contains_symbol(std::vector<SymbolTable>& table_stack, const std::string& name);
+std::vector<std::string> generate_entries_types(std::vector<TableEntry> entries);
+bool is_numeric(const std::string& type1, const std::string& type2);
+bool is_num(const std::string& type);
+std::string get_func_return_type(std::vector<SymbolTable>& table_stack);
+bool is_in_while_scope(std::vector<SymbolTable>& table_stack);
+bool is_in_switch_scope(std::vector<SymbolTable>& table_stack);
+bool is_legit_byte(int byte_val);
+// New code
+#define MAX_LOCAL_VARIABLES 50
+#define code_buffer (CodeBuffer::instance())
+void emit_global_functions();
+std::string print_function_retval(const std::string& type, const std::string& value = "");
+std::string create_func_signature(const std::string func_name, const std::string& ret_type, const std::vector<std::string>& args_types);
+std::string create_alloca(uint32_t elements_count, const std::string& destination_ptr = "base_ptr"); 
+std::string create_zext(const std::string& src, const std::string& dst, const std::string& type);
+std::string create_store(const std::string& src, const std::string& dst);
+std::string create_load(const std::string& dst, const std::string& src);
+std::string create_binop(const std::string& dst, const std::string& src_1, const std::string& src_2, const std::string& op);
+std::string convert_op(const std::string& op_char);
+void do_binop(Node* dst, Node* exp_1, Node* exp_2, const std::string& op_char);
+std::string create_oper(const std::string& op);
+std::string initialize_reg_val(const std::string& dst, const std::string& type, const std::string& val);
+std::string create_bool_trunc(const std::string& reg, const std::string& src);
+std::string create_cond_branch(const std::string& label_1, const std::string& label_2, const std::string& cond);
+std::string create_uncond_branch(const std::string& label_1="@");
+std::string create_call(const std::string& func_name, const std::string& ret_type, const std::vector<std::string>& args_types, const std::vector<std::string>& args_place);
+std::string create_call(Func* inp_func);
+std::string create_dst_call(const std::string& func_name, const std::string& ret_type, const std::vector<std::string>& args_types, const std::vector<std::string>& args_place, const std::string& dst);
+std::string create_dst_call(Func* inp_func, const std::string& dst);
+std::string create_icmp(const std::string& dst, const std::string& src, const std::string& value);
+std::string create_icmp(const std::string& dst, const std::string& src_1, const std::string& src_2, const std::string& oper);
+std::string create_string(const std::string& str_name, const std::string& raw_bytes);
+std::string create_string(const std::string& dst_reg, const std::string& src_string, int string_size);
+std::string get_reg_val(int reg_num);
+std::string get_string_id_place(const std::vector<std::pair<std::string, std::string>>& ids_places, const std::string& input_str);
+std::string create_ret(const std::string& ret_type, const std::string& ret_val = "");
+void load_arguments(Func* func, const std::vector<std::string>& args_types, const std::vector<std::string>&  args_places);
+std::string create_boolean_phi(const std::string& dst, const std::string& label_1, const std::string& label_2);
+void emit_boolean_exp_bp(Node* exp_id, int curr_val);
+void division_handler(Node* dst, Node* exp_1, Node* exp_2, const std::string& op_char);
+std::string create_byte_trunc(const std::string& dst, const std::string& src);
+
+%}
+%define parse.error verbose
+%define parse.trace
+
+%token VOID INT BYTE B BOOL TRUE FALSE RETURN IF WHILE BREAK CONTINUE SWITCH CASE DEFAULT COLON SC COMMA ID NUM STRING 
+%left LBRACE RBRACE
+%right ASSIGN
+%left OR
+%left AND
+%left RELOPSECOND
+%nonassoc RELOPFIRST
+%left BINOPSECOND
+%left BINOPFIRST
+%right NOT
+%left LPAREN %left RPAREN
+%nonassoc IF_PREC
+%nonassoc IF_ELSE_PREC
+%nonassoc SWITCH_WITHOUT_BREAK
+%nonassoc SWITCH_WITH_BREAK
+%right ELSE
+
+%%
+
+// RULES
+S				:	Program
+					{
+						TableEntry main_symbol = get_function(table_stack, "main");
+						if (main_symbol._name == "NO_NAME" || !main_symbol._is_func || main_symbol._type._args_types.size() != 0 || main_symbol._type._return_type != "VOID")
+						{
+							output::errorMainMissing();
+							exit(0);							
+						}
+						
+						offset_stack.pop_back();
+						table_stack.pop_back();
+						return(0);
+					}
+
+
+Program 		:		M1 Funcs																	{}
+;
+
+
+M1				:		
+					{																				
+						SymbolTable global_symtbl;
+						std::vector<std::string> print_args{"STRING"};
+						global_symtbl.insert("print", Type("FUNC", "VOID", print_args, true), 0);
+						offset_stack.push_back(0); // function symbols treated as offset 0
+						std::vector<std::string> printi_args{"INT"};
+						global_symtbl.insert("printi", Type("FUNC", "VOID", printi_args, true), 0);
+						offset_stack.push_back(0);
+						table_stack.push_back(global_symtbl);
+						emit_global_functions();
+					}
+
+
+Funcs			: 		StringFuncDecl Funcs													{}
+				| 		FuncDecl Funcs															{}
+				|																				{}
+;
+
+
+StringFuncDecl		: 	ID M_ID_ERROR M2 LPAREN Formals RPAREN LBRACE M3 Statements RBRACE				// ID is actually return type
+						{
+						table_stack.pop_back();
+						offset_stack.pop_back();
+						}
+;
+
+
+M_ID_ERROR			:	/* epsilon */							// in any case we've reached here - ERROR
+						{
+							output::errorSyn(yylineno);
+							exit(0);
+						}
+
+
+FuncDecl		: 		RetType M2 LPAREN Formals RPAREN LBRACE M3 Statements RBRACE				
+						{
+						table_stack.pop_back();
+						offset_stack.pop_back();
+
+						code_buffer.emit(print_function_retval(static_cast<Node*>($1)->_type));
+						code_buffer.emit("}");
+						}
+;
+
+
+M2				:		ID
+						{																		
+							global_id_sym = (static_cast<String*>($1)->_value);							
+							if (contains_symbol(table_stack, global_id_sym)) {output::errorDef(yylineno, global_id_sym); exit(0);}
+							current_func_name = global_id_sym;
+						}
+
+M3				:		
+						{				
+							table_stack.back().insert(global_id_sym, Type("FUNC", return_type, generate_entries_types(args_entries), true), 0); 
+							for (auto &p : args_entries)
+								{
+									if (contains_symbol(table_stack, p._name))
+									{
+										output::errorDef(yylineno, p._name);
+										exit(0);
+									}
+								}							
+							code_buffer.emit(create_func_signature(current_func_name, return_type, generate_entries_types(args_entries)));
+							code_buffer.genLabel();							 
+							code_buffer.emit(create_alloca(args_entries.size() + MAX_LOCAL_VARIABLES));
+							int arg_pos = 0;
+							for (auto& arg_entry : args_entries)
+							{
+								int reg_num = current_register_num++;
+								arg_entry._place = get_reg_val(reg_num);			
+								code_buffer.emit("%" + arg_entry._place + " = alloca i32");
+							
+								if (arg_entry._type._basic_type == "BOOL")
+								{
+									std::string helper_place(get_reg_val(current_register_num++));									
+									code_buffer.emit(create_zext("%" + to_string(arg_pos), helper_place, "BOOL"));
+									code_buffer.emit(create_store(helper_place, arg_entry._place));
+								}
+								else { code_buffer.emit(create_store(to_string(arg_pos), arg_entry._place)); }
+								arg_pos++;
+							}
+							SymbolTable func_symtbl;
+							func_symtbl._scope_type = SCOPE_FUNC; // check this
+							func_symtbl.insert(args_entries);  
+							table_stack.push_back(func_symtbl);
+							offset_stack.push_back(offset_stack.back());
+							args_entries.clear();
+						}
+
+
+RetType 		:		Type																	
+						{				
+							$$ = $1; // check this													
+							return_type = static_cast<Node*>($1)->_type;
+						}
+				|		VOID     
+						{																		
+							$$ = $1; // check this
+							return_type = std::string("VOID");
+						}                                                               
+;
+
+
+Formals 		:																				{}
+				|		FormalsList                                                             {}
+;
+
+
+FormalsList		:		FormalDecl																{}
+				|		FormalDecl COMMA FormalsList                                            {}
+;
+
+
+FormalDecl		: 		Type ID 	{
+										TableEntry t(static_cast<String*>($2)->_value, Type(static_cast<Node*>($1)->_type), -args_entries.size() - 1);	
+										for (auto &p : args_entries)
+										{
+											if (p._name == static_cast<String*>($2)->_value)
+											{
+												output::errorDef(yylineno, ((String*)$2)->_value);
+												exit(0);
+											}
+										}		
+										args_entries.push_back(t);
+									}
+;
+
+
+Statements 		:		Statement																{}
+				|		Statements Statement                                                    {
+																									$$->next_list = code_buffer.merge($1->next_list, $2->next_list);
+																									$$->continue_list = code_buffer.merge($1->continue_list, $2->continue_list); // CHECK THIS																									
+																									$$->_statement_contains_break = $1->_statement_contains_break || $2->_statement_contains_break;
+																								}
+;
+
+
+Statement 		:		LBRACE M_OPEN_SCOPE Statements M_CLOSE_SCOPE RBRACE											{$$ = $3;}
+				|		Type ID SC      {
+										if (contains_symbol(table_stack, static_cast<String*>($2)->_value))
+										{
+											output::errorDef(yylineno, static_cast<String*>($2)->_value);
+											exit(0);
+										}
+										else 
+										{
+											offset_entry_t& offset_top = offset_stack.back();
+											$2->_place = get_reg_val(current_register_num);
+											$2->_type = $1->_type;
+											code_buffer.emit(initialize_reg_val(get_reg_val(current_register_num++),"INT", "0"));
+											$$->_place=get_reg_val(current_register_num);											
+											code_buffer.emit("%"+ $$->_place +" = alloca i32");											
+											code_buffer.emit(create_store($2->_place, get_reg_val(current_register_num++)));							
+											table_stack.back().insert(static_cast<String*>($2)->_value, Type(static_cast<Node*>($1)->_type), offset_top, $$->_place);		
+											offset_top += 1;
+										}
+										}
+				|		Type ID ASSIGN Exp SC 													{																								
+																								int helper_reg_1;
+																								if (contains_symbol(table_stack, static_cast<String*>($2)->_value))
+																								{
+																									output::errorDef(yylineno, ((String*)$2)->_value);
+																									exit(0);
+																								}
+																								auto type1(static_cast<Node*>($1)->_type);
+																								auto type2(static_cast<Node*>($4)->_type);																																														
+																								if (!(type1 == type2 || (type1 == "INT" && type2 == "BYTE")))
+																								{
+																									output::errorMismatch(yylineno);
+																									exit(0);
+																								}
+																								if (type2 == "BOOL")
+																								{
+																									$2->_place = get_reg_val(current_register_num); 
+																									helper_reg_1 = current_register_num++; 
+																									$2->true_list = $4->true_list;
+																									$2->false_list = $4->false_list;
+																									emit_boolean_exp_bp($2, helper_reg_1);
+																									$4->_place = get_reg_val(helper_reg_1) ; // check this																																												
+																								}
+																								else
+																								{
+																									$2->_place = get_reg_val(current_register_num);
+																									helper_reg_1 = current_register_num;
+																									code_buffer.emit(initialize_reg_val(get_reg_val(current_register_num++), $1->_type, $4->_place));
+																								}
+																								$$->_place = get_reg_val(current_register_num);
+																								$$->_type = $4->_type;
+																								int helper_reg_2 = current_register_num++;																								
+																								code_buffer.emit("%" + get_reg_val(helper_reg_2) + " = alloca i32");
+																								if (type2 == "BOOL") 
+																								{
+																									code_buffer.emit(create_zext("%" + $4->_place, get_reg_val(current_register_num), "BOOL")); 
+																									code_buffer.emit(create_store(get_reg_val(current_register_num++), get_reg_val(helper_reg_2)));																									 
+																								}
+																								else { code_buffer.emit(create_store(get_reg_val(helper_reg_1), get_reg_val(helper_reg_2))); }
+																								$2->_is_zero_ext = true;
+																								$$->_is_zero_ext = true;
+																								offset_entry_t& offset_top = offset_stack.back();
+																								table_stack.back().insert(((String*)$2)->_value, Type(static_cast<Node*>($1)->_type), offset_top, get_reg_val(helper_reg_2));
+																								offset_top += 1;											
+																								}
+
+
+				|		ID ASSIGN Exp SC 														{
+																								auto type1(find_symbol_type(table_stack, static_cast<String*>($1)->_value)); // get type from SYMTBL
+																								if (!contains_symbol(table_stack, static_cast<String*>($1)->_value) || type1 == std::string("FUNC"))
+																								{
+																									output::errorDef(yylineno, ((String*)$1)->_value);
+																									exit(0);
+																								}
+																								auto type2(static_cast<Node*>($3)->_type);
+																								if (!(type1 == type2 || (type1 == "INT" && type2 == "BYTE")))
+																								{
+																									output::errorMismatch(yylineno);
+																									exit(0);
+																								}
+																								int helper_reg1 = 0;
+																								if (type2 == "BOOL")
+																								{
+																									$1->_place = get_reg_val(current_register_num); 
+																									helper_reg1 = current_register_num++; // check this
+																									$1->true_list = $3->true_list;
+																									$1->false_list = $3->false_list;
+																									emit_boolean_exp_bp($1 ,helper_reg1);
+																									$3->_place = get_reg_val(helper_reg1) ;	
+																								}
+																								else
+																								{
+																									$1->_place = get_reg_val(current_register_num);
+																									helper_reg1 = current_register_num;
+																									code_buffer.emit(initialize_reg_val(get_reg_val(current_register_num++), $3->_type, $3->_place)); // check this
+																								}
+																								$$ = new Node();
+																								$$->_place = get_reg_val(current_register_num);
+																								int helper_reg2 = current_register_num++;																	
+																								code_buffer.emit("%" + get_reg_val(helper_reg2) + " = alloca i32");																								
+																								auto curr_entry = get_entry(table_stack, static_cast<String*>($1)->_value);																			
+																								if (type2 == "BOOL") 
+																								{
+																									code_buffer.emit(create_zext("%" + $3->_place, get_reg_val(current_register_num), "BOOL")); // check this
+																									code_buffer.emit(create_store(get_reg_val(current_register_num++), get_reg_val(helper_reg2))); 
+																									code_buffer.emit(create_store(get_reg_val(current_register_num - 1) ,curr_entry._place)); 
+																								}
+																								else
+																								{
+																									code_buffer.emit(create_store(get_reg_val(helper_reg1), get_reg_val(helper_reg2)));
+																									code_buffer.emit(create_store(get_reg_val(helper_reg1), curr_entry._place)); 
+																								}
+																								$1->_is_zero_ext = true;
+																								$$->_is_zero_ext = true;																								
+																								}
+
+
+				|		Call SC 																{
+																								$$ = $1;
+																								code_buffer.emit(create_call(static_cast<Func*>($1)));
+																								}
+
+
+				|		RETURN SC 																{
+																								std::string ret_type(get_func_return_type(table_stack));
+																								if (ret_type != "VOID")
+																								{
+																									output::errorMismatch(yylineno);
+																									exit(0);
+																								}
+																								code_buffer.emit(create_ret("VOID"));
+																								}
+
+
+				|		RETURN Exp SC 															{
+																								std::string ret_type(get_func_return_type(table_stack));																								
+																								std::string exp_type(static_cast<Node*>($2)->_type);
+																								std::string exp_place($2->_place);
+																								if (exp_type == "FUNC")
+																								{
+																									output::errorUndef(yylineno, static_cast<String*>($2)->_value);
+																									exit(0);
+																								}
+																								if (exp_type == "VOID" ||  ((exp_type != ret_type) && !is_numeric(exp_type, return_type)))
+																								{
+																									output::errorMismatch(yylineno);
+																									exit(0);
+																								}
+																								if (exp_type == "BOOL")
+																								{
+																									int helper_reg_1 = current_register_num++;
+																									emit_boolean_exp_bp($2, helper_reg_1);
+																									code_buffer.emit(create_ret($2->_type, get_reg_val(helper_reg_1)));
+																								}
+																								else
+																								{
+																									code_buffer.emit(initialize_reg_val(get_reg_val(current_register_num), exp_type, "%" + exp_place));
+																									code_buffer.emit(create_ret(exp_type, get_reg_val(current_register_num++)));					
+																								}
+																								}
+
+
+				|		M_IF_SCOPE Statement M_CLOSE_SCOPE %prec IF_PREC   						{
+																								$$ = new Node();
+																								// $$->next_list = $1->next_list; 
+																								$$->false_list = $1->false_list;
+																								$$->true_list = $2->next_list;
+																								$$->break_list = $2->break_list;
+																								$$->continue_list = $2->continue_list;
+																								$$->next_list = code_buffer.merge($1->next_list, $2->next_list); // check this
+																								int current_location = code_buffer.emit(create_uncond_branch());
+																								std::string curr_label(code_buffer.genLabel());
+																								code_buffer.bpatch(code_buffer.makelist({current_location, FIRST}), curr_label);
+																								code_buffer.bpatch($$->false_list, curr_label);
+																								} 		
+
+
+				|		M_IF_SCOPE Statement M_CLOSE_SCOPE M_ELSE_SCOPE Statement M_CLOSE_SCOPE %prec IF_ELSE_PREC			{
+																															$$ = new Node();
+																															int current_location = code_buffer.emit(create_uncond_branch());
+																															std::string curr_label(code_buffer.genLabel());
+																															code_buffer.bpatch(code_buffer.makelist({current_location, FIRST}), curr_label);
+																															code_buffer.bpatch(code_buffer.makelist({$4->_lineNo, FIRST}) , curr_label); // check this - should be else location
+																															code_buffer.bpatch($1->false_list, $4->_place); // check this - should be else label
+																															$$->next_list = code_buffer.merge($2->next_list, $5->next_list);
+																															$$->break_list = code_buffer.merge($2->break_list, $5->break_list); // check this
+																															$$->continue_list = code_buffer.merge($2->continue_list, $5->continue_list);
+																															}
+
+
+				|		M_WHILE_SCOPE M_WHILE_HELPER Statement M_CLOSE_SCOPE					{
+																								$$ = new Node();
+																								code_buffer.bpatch($1->true_list, static_cast<String*>($2)->_value);
+																								code_buffer.bpatch($3->continue_list, static_cast<String*>($1)->_value); // check this
+																								int tmp_location = code_buffer.emit(create_uncond_branch());																								
+																								code_buffer.bpatch(code_buffer.makelist({tmp_location, FIRST}), static_cast<String*>($1)->_value); // check this!																								
+																								int next_location = code_buffer.emit(create_uncond_branch());
+																								std::string next_label(code_buffer.genLabel());		
+																								//code_buffer.emit("next label (above)" + next_label);		
+																								code_buffer.bpatch(code_buffer.makelist({next_location, FIRST}), next_label);
+																								code_buffer.bpatch($1->false_list, next_label); 
+																								code_buffer.bpatch($3->next_list, next_label); // check this - might lack bool next
+																								$$->next_list = $1->false_list; // should extermely check this out	
+																								}
+
+
+				|		BREAK SC																{
+																								if (!(is_in_while_scope(table_stack) || is_in_switch_scope(table_stack))) 
+																								{
+																									output::errorUnexpectedBreak(yylineno);
+																									exit(0);
+																								}
+																								int current_location = code_buffer.emit(create_uncond_branch());
+																								$$->next_list = code_buffer.makelist({current_location, FIRST});
+																								$$->_statement_contains_break = true;
+																								}
+
+
+				|		CONTINUE SC																{
+																								if (!is_in_while_scope(table_stack)) 
+																								{
+																									output::errorUnexpectedContinue(yylineno);
+																									exit(0);
+																								}
+																								int current_location = code_buffer.emit(create_uncond_branch());
+																								$$->continue_list = code_buffer.makelist({current_location, FIRST});
+																								}
+
+
+				|		M_SWITCH_SCOPE LBRACE CaseList RBRACE M_CLOSE_SCOPE						{
+																									std::string curr_quad;
+																									std::string check_switch_label(code_buffer.genLabel());																																																		
+																									code_buffer.bpatch($1->next_list, check_switch_label);
+																									auto false_lists_container = std::vector<std::vector<pair<int,BranchLabelIndex>>>();
+																									auto labels_container = std::vector<std::string>();
+																									auto was_breaked_container = std::vector<bool>();																									 
+																									std::vector<std::string> quad_list_copy = static_cast<Caselist*>($3)->_quad_list;
+																									auto default_true_list = std::vector<pair<int,BranchLabelIndex>>();
+																									bool cases_contains_default = static_cast<Caselist*>($3)->_contains_default;
+																									int original_quad_size = static_cast<Caselist*>($3)->_quad_list.size();
+																									int i = 0;
+																									while (static_cast<Caselist*>($3)->_quad_list.size() != 0)
+																									{
+																										if (i == 0) {labels_container.push_back("dontcare");}
+																										else { labels_container.push_back(code_buffer.genLabel()); }
+																										int curr_value = static_cast<Caselist*>($3)->_numeric_val_list.back();
+																										curr_quad = static_cast<Caselist*>($3)->_quad_list.back();
+																										static_cast<Caselist*>($3)->_numeric_val_list.pop_back();
+																										static_cast<Caselist*>($3)->_quad_list.pop_back();																		
+																										int new_reg_num = current_register_num++;
+																										if (!((i == original_quad_size - 1) && cases_contains_default)) 
+																										{
+																											code_buffer.emit(initialize_reg_val(get_reg_val(new_reg_num), "INT", to_string(curr_value)));
+																											code_buffer.emit(create_icmp(get_reg_val(current_register_num), $1->_place, get_reg_val(new_reg_num), "eq"));
+																											int current_location = code_buffer.emit(create_cond_branch("@", "@", get_reg_val(current_register_num++)));
+																											auto curr_true_list = code_buffer.makelist({current_location, FIRST}); // check this or these
+																											code_buffer.bpatch(curr_true_list, curr_quad);
+																											auto curr_false_list = code_buffer.makelist({current_location, SECOND});
+																											false_lists_container.push_back(curr_false_list);
+																										}
+																										else 
+																										{																											
+																											int current_location = code_buffer.emit(create_uncond_branch());
+																											default_true_list = code_buffer.makelist({current_location, FIRST});
+																											//code_buffer.bpatch(default_true_list, switch_end_location);
+																											false_lists_container.push_back(code_buffer.makelist({0, SECOND})); // for consistency
+																										}																						
+																										i = i + 1;
+																									}
+																									int switch_end_location = code_buffer.emit(create_uncond_branch());
+																									auto switch_end_label = code_buffer.genLabel();
+																									$$->next_list = code_buffer.merge($3->next_list, code_buffer.makelist({switch_end_location, FIRST})); // check this
+																									for (int i = 0 ; i < false_lists_container.size() ; i++)
+																									{
+																										if (i != (false_lists_container.size() - 1) ) { code_buffer.bpatch(false_lists_container[i], labels_container[i + 1]);}
+																										else // reached last element
+																										{ 
+																											if (!cases_contains_default) {code_buffer.bpatch(false_lists_container[i], switch_end_label);}
+																											else {code_buffer.bpatch(default_true_list, quad_list_copy[0]);} // 
+																										}																										
+																									}																																																			
+																									for (int i = (quad_list_copy.size() - 1) ; i >= 0 ; i--)
+																									{																																																																											
+																										bool was_breaked = static_cast<Caselist*>($3)->_contains_break_list[i];																																																	
+																										if (((was_breaked == 1) || (i == 0)) && (!cases_contains_default)) { code_buffer.bpatch(static_cast<Caselist*>($3)->_conds_next_lists[i] , switch_end_label); } // validate nextlist of the right case!
+																										else if (((was_breaked == 1) && (i != 0)) && (cases_contains_default)) { code_buffer.bpatch(static_cast<Caselist*>($3)->_conds_next_lists[i] , switch_end_label); } // check this																										
+																										else if (i == 0 && cases_contains_default) { code_buffer.bpatch(static_cast<Caselist*>($3)->_conds_next_lists[i] , switch_end_label);}																										
+																										else { code_buffer.bpatch(static_cast<Caselist*>($3)->_conds_next_lists[i] , quad_list_copy[i - 1]); } 		// and check this																																																		
+																									}
+																									code_buffer.bpatch($$->next_list, switch_end_label); // check this	
+																									$$->continue_list = $3->continue_list;																								
+																								} 
+;
+
+
+M_IF_SCOPE				:	IF LPAREN Exp RPAREN							{
+																				if (static_cast<Node*>($3)->_type != "BOOL")
+																				{
+																					output::errorMismatch(yylineno);
+                            														exit(0);
+																				}
+																				SymbolTable t;
+																				table_stack.push_back(t);
+																				offset_stack.push_back(offset_stack.back());
+																				std::string if_label(code_buffer.genLabel());
+																				code_buffer.bpatch($3->true_list, if_label);
+																				$$ = new Node();
+																				$$->next_list = $3->false_list;
+																				$$->false_list = $3->false_list;
+																			}	
+
+
+M_ELSE_SCOPE			:	ELSE
+						{
+							SymbolTable t;
+							table_stack.push_back(t);
+							offset_stack.push_back(offset_stack.back());
+
+							
+
+							else_location = code_buffer.emit(create_uncond_branch());							
+							else_label = code_buffer.genLabel();
+
+							$$ = new Node();
+							$$->_lineNo = else_location;
+							$$->_place = else_label;
+						}
+
+
+M_WHILE_SCOPE			:	WHILE LPAREN M_WHILE_HELPER_1 Exp RPAREN
+						{
+							if (static_cast<Node*>($4)->_type != "BOOL")
+							{
+								output::errorMismatch(yylineno);
+                            	exit(0);
+							}
+							SymbolTable t;
+							t._scope_type = SCOPE_WHILE;
+							table_stack.push_back(t);
+							offset_stack.push_back(offset_stack.back());
+							$$ = new String(static_cast<String*>($3)->_value);
+							$$->true_list = $4->true_list;
+							$$->false_list = $4->false_list;
+						}
+
+
+M_WHILE_HELPER			:
+						{
+							$$ = new String(code_buffer.genLabel());
+						}
+
+
+M_WHILE_HELPER_1		:
+						{
+							while_location = code_buffer.emit(create_uncond_branch());
+							while_label = code_buffer.genLabel();
+							code_buffer.bpatch(code_buffer.makelist({while_location, FIRST}), while_label); 
+							$$ = new String(while_label);
+						}
+
+
+M_SWITCH_SCOPE			: SWITCH LPAREN Exp RPAREN												
+						{
+							if (!(static_cast<Node*>($3)->_type == "INT" || static_cast<Node*>($3)->_type == "BYTE"))
+							{
+								output::errorMismatch(yylineno);
+                            	exit(0);
+							}
+							SymbolTable t;
+							t._scope_type = SCOPE_SWITCH;
+							table_stack.push_back(t);
+							offset_stack.push_back(offset_stack.back());
+							$$ = new Node();
+							$$->_place = $3->_place; 
+							int switch_location = code_buffer.emit(create_uncond_branch());
+							$$->next_list = code_buffer.makelist({switch_location, FIRST});
+						}
+
+
+M_OPEN_SCOPE			:	
+						{																		
+							SymbolTable statement_symtable;
+							table_stack.push_back(statement_symtable); 
+							offset_stack.push_back(offset_stack.back());
+						}
+
+
+M_CLOSE_SCOPE			:
+						{																		
+							table_stack.pop_back();
+							offset_stack.pop_back();
+						}
+
+
+Call	 		:		ID LPAREN ExpList RPAREN												{
+																								if (!contains_symbol(table_stack, static_cast<String*>($1)->_value))
+																								{
+																									output::errorUndefFunc(yylineno, (static_cast<String*>($1)->_value));
+																									exit(0);
+																								}
+																								TableEntry t(get_entry(table_stack, static_cast<String*>($1)->_value));
+																								if (!t._is_func)
+																								{
+																									output::errorUndefFunc(yylineno, (static_cast<String*>($1)->_value));
+																									exit(0);
+																								}
+																								if (t._type._args_types.size() != curr_func_args_types.size())
+																								{
+																									output::errorPrototypeMismatch(yylineno, (static_cast<String*>($1)->_value), t._type._args_types);
+																									exit(0);
+																								}
+																								std::reverse(curr_func_args_types.begin(), curr_func_args_types.end());
+																								std::reverse(curr_func_args_values.begin(), curr_func_args_values.end());
+																								std::reverse(curr_func_args_places.begin(), curr_func_args_places.end());
+																								std::string type1;
+																								std::string type2;
+																								for (uint32_t i = 0 ; i < t._type._args_types.size() ; i++)
+																								{
+																									type1 = t._type._args_types[i];
+																									type2 = curr_func_args_types[i];																									
+																									if (!(type1 == type2 || (type1 == "INT" && type2 == "BYTE")))
+																									{
+																										output::errorPrototypeMismatch(yylineno, (static_cast<String*>($1)->_value), t._type._args_types);
+																										exit(0);
+																									}																									
+																									if ((type1 == "BYTE" && type2 == "INT" && !is_legit_byte(curr_func_args_values[i])))
+																									{
+																										output::errorByteTooLarge(yylineno, std::to_string(static_cast<Num*>($4)->_value));
+																										exit(0);
+																									}																									
+																								}																								
+																								static_cast<Node*>($$)->_type = t._type._return_type; // check this - unnessecary?																								
+																								$$ = new Func(static_cast<String*>($1)->_value, t._type._return_type);
+																								load_arguments(static_cast<Func*>($$), curr_func_args_types, curr_func_args_places);
+																								if (static_cast<Func*>($$)->_contains_bool_arg) // check this
+																								{																									
+																									int current_location = code_buffer.emit(create_uncond_branch());
+																									auto curr_list = code_buffer.makelist({current_location, FIRST});
+																									const std::string next_label(code_buffer.genLabel());
+																									code_buffer.bpatch(curr_list, next_label);																									
+																									code_buffer.bpatch($3->true_list, next_label);
+																									code_buffer.bpatch($3->false_list, next_label);
+																								}
+																								curr_func_args_values.clear();
+																								curr_func_args_types.clear();
+																								curr_func_args_places.clear();
+																								}
+
+
+				|		ID LPAREN RPAREN	                                                    {
+																								if (!contains_symbol(table_stack, static_cast<String*>($1)->_value))
+																								{
+																									output::errorUndefFunc(yylineno, (static_cast<String*>($1)->_value));
+																									exit(0);
+																								}																								
+																								TableEntry t(get_entry(table_stack, static_cast<String*>($1)->_value));
+																								if (!t._is_func)
+																								{
+																									output::errorUndefFunc(yylineno, (static_cast<String*>($1)->_value));
+																									exit(0);
+																								}
+																								if (t._type._args_types.size() > 0)
+																								{
+																									output::errorPrototypeMismatch(yylineno, (static_cast<String*>($1)->_value), t._type._args_types);
+																									exit(0);
+																								}
+																								static_cast<Node*>($$)->_type = t._type._return_type; // check this
+																								$$ = new Func(static_cast<String*>($1)->_value, t._type._return_type);
+																								}
+;
+
+
+ExpList	 		:		Exp																		{																					
+																								if ($1->_type == "BOOL")
+																								{
+																									emit_boolean_exp_bp($1, current_register_num++);
+																									$1->_place = get_reg_val(current_register_num - 1); // check this
+																								}
+																								curr_func_args_types.push_back(static_cast<Node*>($1)->_type);
+																								curr_func_args_places.push_back(static_cast<Node*>($1)->_place);
+																								if (static_cast<Node*>($1)->_type == "INT") {curr_func_args_values.push_back(static_cast<Num*>($1)->_value);}
+																								else {curr_func_args_values.push_back(-1);}	
+																								}
+
+
+				|		M_Exp COMMA ExpList	                                                    {
+																								curr_func_args_types.push_back(static_cast<Node*>($1)->_type);
+																								curr_func_args_places.push_back(static_cast<Node*>($1)->_place);
+																								if (static_cast<Node*>($1)->_type == "INT") {curr_func_args_values.push_back(static_cast<Num*>($1)->_value);}
+																								else {curr_func_args_values.push_back(-1);}
+																								}
+;
+
+
+M_Exp			:		Exp																		{
+																									$$ = new Node();
+																									if ($1->_type == "BOOL")
+																									{
+																										emit_boolean_exp_bp($1, current_register_num++);
+																										$1->_place = get_reg_val(current_register_num - 1); // check this
+																									}
+																									$$ = $1;
+																								}
+;
+
+
+
+Type	 		:		INT																		{ $$ = $1; }
+
+
+				|		BYTE	                                                    			{ $$ = $1; }
+
+
+				|		BOOL																	{ $$ = $1; }
+;
+
+
+Exp 	 		:		LPAREN Exp RPAREN														{ $$ = $2; }																																																			
+				|		Exp BINOPFIRST Exp                                            			{
+																								if (!is_numeric(static_cast<Node*>($1)->_type, static_cast<Node*>($3)->_type))
+																								{
+																									output::errorMismatch(yylineno); 
+																									exit(0);
+																								}
+																								if (static_cast<Node*>($1)->_type == static_cast<Node*>($3)->_type)
+																								{
+																									if (static_cast<Node*>($1)->_type == "BYTE") {static_cast<Node*>($$)->_type = "BYTE";}
+																									if (static_cast<Node*>($1)->_type == "INT") {static_cast<Node*>($$)->_type = "INT";}
+																								}					
+																								else { static_cast<Node*>($$)->_type = "INT"; }
+																								$$ = new Node();
+																								do_binop($$, $1, $3, static_cast<String*>($2)->_value);
+																								}
+
+
+				|		Exp BINOPSECOND Exp                                            			{
+																								if (!is_numeric(static_cast<Node*>($1)->_type, static_cast<Node*>($3)->_type))
+																								{
+																									output::errorMismatch(yylineno); 
+																									exit(0);
+																								}
+																								if (static_cast<Node*>($1)->_type == static_cast<Node*>($3)->_type)
+																								{
+																									if (static_cast<Node*>($1)->_type == "BYTE") {static_cast<Node*>($$)->_type = "BYTE";}
+																									if (static_cast<Node*>($1)->_type == "INT") {static_cast<Node*>($$)->_type = "INT";}
+																								}					
+																								else { static_cast<Node*>($$)->_type = "INT"; }	
+																								$$ = new Node();
+																								do_binop($$, $1, $3, static_cast<String*>($2)->_value);
+																								}
+
+																							
+				|		ID 																		{
+																								if (!contains_symbol(table_stack, static_cast<String*>($1)->_value))
+																								{
+																									output::errorUndef(yylineno, ((String*)$1)->_value);
+																									exit(0);
+																								}
+																								static_cast<Node*>($$)->_type = find_symbol_type(table_stack, static_cast<String*>($1)->_value);						
+																								$$->_is_zero_ext = $1->_is_zero_ext;
+																								if (contains_symbol(table_stack, static_cast<String*>($1)->_value))
+																								{
+																									std::string cur_place(get_entry(table_stack, static_cast<String*>($1)->_value)._place);
+																									$$->_place = get_reg_val(current_register_num);
+																									code_buffer.emit(create_load(get_reg_val(current_register_num++), cur_place));
+																								}
+																								else
+																								{
+																									std::cout << "shouldnt get into here? check this\n";
+																								}
+																								if ($$->_type == "BOOL")
+																								{
+																									int helper_reg_3 = current_register_num++;
+																									code_buffer.emit(create_bool_trunc("r" + to_string(helper_reg_3), $$->_place)); // check this - $$ or $1?
+																									$$->_place = get_reg_val(helper_reg_3);
+																									// check this - code for branches
+																									int branch_location = code_buffer.emit(create_cond_branch("@", "@", "r" + to_string(helper_reg_3)));
+																									$$->true_list = code_buffer.makelist(pair<int,BranchLabelIndex>(branch_location, FIRST));
+																									$$->false_list = code_buffer.makelist(pair<int,BranchLabelIndex>(branch_location, SECOND));
+																								}																								
+																								}
+
+
+				|		Call 																	{
+																								$$ = $1;
+																								$$->_place = get_reg_val(current_register_num);
+																								std::string helper_reg_str = $$->_place; // check this - might be not needed
+																								code_buffer.emit(create_dst_call(static_cast<Func*>($1), get_reg_val(current_register_num++)));																								
+																								if (static_cast<Func*>($1)->_ret_type == "BOOL")
+																								{
+																									$$->_place = helper_reg_str;
+																									int helper_reg_5 = current_register_num++;
+																									code_buffer.emit(create_zext("%" + $1->_place, get_reg_val(helper_reg_5), static_cast<Func*>($1)->_ret_type));
+																									code_buffer.emit((create_icmp(get_reg_val(current_register_num++), get_reg_val(helper_reg_5), "1")));
+																									int current_location = code_buffer.emit(create_cond_branch("@", "@", helper_reg_str));
+																									$$->true_list = code_buffer.makelist({current_location, FIRST});
+																									$$->false_list = code_buffer.makelist({current_location, SECOND});
+																								}																																													
+																								}
+
+
+				|		NUM 																	{
+																								// $$ = new Node();
+																								$$ = $1;
+																								static_cast<Node*>($$)->_type = "INT";
+																								$$->_place = get_reg_val(current_register_num);											
+																								code_buffer.emit(initialize_reg_val(get_reg_val(current_register_num++), "INT", to_string(static_cast<Num*>($1)->_value)));
+																								}
+
+
+				|		NUM B 																	{
+																								int byte_val =  static_cast<Num*>($1)->_value;
+																								if (byte_val < 0 || byte_val > 255)
+																								{
+																									output::errorByteTooLarge(yylineno, std::to_string(byte_val));
+																									exit(0);
+																								}																								
+																								code_buffer.emit(create_zext(to_string(byte_val), get_reg_val(current_register_num), "BYTE"));
+																								int helper_reg_4 = current_register_num++;
+																								static_cast<Node*>($$)->_type = "BYTE";
+																								$$->_place = get_reg_val(current_register_num);
+																								code_buffer.emit(initialize_reg_val(get_reg_val(current_register_num++), "BYTE", "%" + get_reg_val(helper_reg_4)));																																																
+																								}
+
+
+				|		STRING 																	{
+																								$$ = $1; 
+																								int auxilary_reg = current_register_num++;
+																								std::string str_id(static_cast<String*>($1)->_value);
+																								std::string str_place(get_string_id_place(allocated_strings, str_id));
+																								if (str_place == "")
+																								{
+																									std::string new_str_place(get_reg_val(current_register_num++));
+																									code_buffer.emitGlobal(create_string(new_str_place, str_id)); // check this
+																									allocated_strings.push_back(std::pair<std::string, std::string>(str_id, new_str_place));
+																									str_place = new_str_place;
+																								}
+																								$$ = new String(str_id);
+																								static_cast<String*>($$)->_place = get_reg_val(auxilary_reg);
+																								code_buffer.emit(create_string(get_reg_val(auxilary_reg), str_place, str_id.size() - 1));
+																								}
+
+
+				|		TRUE 																	{
+																								//$$ = new Node("BOOL"); should check this out
+																								$$ = $1;
+																								$$->_place = get_reg_val(current_register_num);
+																								code_buffer.emit(initialize_reg_val(get_reg_val(current_register_num++), "BOOL", "1"));																								
+																								int current_loc = code_buffer.emit(create_uncond_branch());
+																								$$->true_list = code_buffer.makelist({current_loc, FIRST});
+																								$$->false_list = std::vector<std::pair<int,BranchLabelIndex>>();	
+																								}
+
+
+				|		FALSE 																	{
+																								$$ = $1;
+																								$$->_place = get_reg_val(current_register_num);
+																								code_buffer.emit(initialize_reg_val(get_reg_val(current_register_num++), "BOOL", "0"));																								
+																								int current_loc = code_buffer.emit(create_uncond_branch());
+																								$$->false_list = code_buffer.makelist({current_loc, FIRST});
+																								$$->true_list = std::vector<std::pair<int,BranchLabelIndex>>();
+																								}
+
+
+				|		NOT Exp 																{
+																								if (static_cast<Node*>($2)->_type != "BOOL")
+																								{
+																									output::errorMismatch(yylineno);
+																									exit(0);
+																								}
+																								$$ = new Node();
+																								$$->_type = "BOOL";
+																								$$->true_list = $2->false_list;
+																								$$->false_list = $2->true_list;
+																								$$->_place = get_reg_val(current_register_num++); 		// check this - NOT might contain bug																								
+																								}
+
+
+				|		Exp AND M_LABEL Exp														{
+																								if ((static_cast<Node*>($1)->_type != "BOOL") || (static_cast<Node*>($4)->_type != "BOOL"))
+																								{
+																									output::errorMismatch(yylineno);
+																									exit(0);
+																								}
+																								$$ = new Node();
+																								static_cast<Node*>($$)->_type = "BOOL";
+																								$$->true_list = $4->true_list;
+																								$$->false_list = code_buffer.merge($1->false_list, $4->false_list); 
+																								code_buffer.bpatch($1->true_list, static_cast<String*>($3)->_value);
+																								// need to add to false_list the remaining code
+																								int current_location = code_buffer.emit(create_uncond_branch());
+																								auto extension_falselist = code_buffer.makelist(std::pair<int,BranchLabelIndex>(current_location, FIRST));
+																								$$->false_list = code_buffer.merge($$->false_list, extension_falselist);
+																								}
+
+
+				|		Exp OR M_LABEL Exp														{
+																								if ((static_cast<Node*>($1)->_type != "BOOL") || (static_cast<Node*>($4)->_type != "BOOL"))
+																								{
+																									output::errorMismatch(yylineno);
+																									exit(0);
+																								}
+																								$$ = new Node();
+																								static_cast<Node*>($$)->_type = "BOOL";
+																								$$->true_list = code_buffer.merge($1->true_list, $4->true_list);
+																								$$->false_list = $4->false_list;
+																								code_buffer.bpatch($1->false_list, static_cast<String*>($3)->_value);
+																								// check this
+																								int current_location = code_buffer.emit(create_uncond_branch());
+																								auto extension_truelist = code_buffer.makelist(std::pair<int,BranchLabelIndex>(current_location, FIRST));
+																								$$->true_list = code_buffer.merge($$->true_list, extension_truelist);
+																								}
+
+
+				|		Exp RELOPFIRST Exp 									 					{
+																								if (!is_num(static_cast<Node*>($1)->_type) || !is_num(static_cast<Node*>($3)->_type))
+																								{
+																									output::errorMismatch(yylineno);
+																									exit(0);
+																								}
+																								$$ = new Node();
+																								static_cast<Node*>($$)->_type = "BOOL";
+																								$$->_place = get_reg_val(current_register_num);
+																								code_buffer.emit(create_icmp(get_reg_val(current_register_num), $1->_place, $3->_place, create_oper(static_cast<String*>($2)->_value)));
+																								int current_location = code_buffer.emit(create_cond_branch("@", "@", get_reg_val(current_register_num++)));
+																								$$->true_list = code_buffer.makelist(pair<int, BranchLabelIndex>(current_location, FIRST));
+																								$$->false_list = code_buffer.makelist(pair<int, BranchLabelIndex>(current_location, SECOND));																								
+																								}
+
+
+				|		Exp RELOPSECOND Exp 									 				{
+																								if (!is_num(static_cast<Node*>($1)->_type) || !is_num(static_cast<Node*>($3)->_type))
+																								{
+																									output::errorMismatch(yylineno);
+																									exit(0);
+																								}
+																								$$ = new Node();
+																								static_cast<Node*>($$)->_type = "BOOL";
+																								$$->_place = get_reg_val(current_register_num);
+																								code_buffer.emit(create_icmp(get_reg_val(current_register_num), $1->_place, $3->_place, "eq"));
+																								int current_location = code_buffer.emit(create_cond_branch("@", "@", get_reg_val(current_register_num++)));
+																								if (static_cast<String*>($2)->_value == "==")
+																								{
+																									$$->true_list = code_buffer.makelist(pair<int, BranchLabelIndex>(current_location, FIRST));
+																									$$->false_list = code_buffer.makelist(pair<int, BranchLabelIndex>(current_location, SECOND));
+																								}
+																								else if (static_cast<String*>($2)->_value == "!=")
+																								{
+																									$$->true_list = code_buffer.makelist(pair<int, BranchLabelIndex>(current_location, SECOND));
+																									$$->false_list = code_buffer.makelist(pair<int, BranchLabelIndex>(current_location, FIRST));
+																								}
+																								}
+
+
+				|		LPAREN Type RPAREN Exp 													{
+																								if (static_cast<Node*>($2)->_type == "INT" && (static_cast<Node*>($4)->_type == "BYTE" || static_cast<Node*>($4)->_type == "NUM"))
+																								{
+																									static_cast<Node*>($$)->_type = "INT"; 
+																								}
+																								else if (static_cast<Node*>($2)->_type == "BYTE" && (static_cast<Node*>($4)->_type == "INT" || static_cast<Node*>($4)->_type == "NUM"))
+																								{
+																									static_cast<Node*>($$)->_type = "BYTE";
+																								}
+																								else
+																								{
+																									output::errorMismatch(yylineno);
+																									exit(0);
+																								}
+																								$$ = $4;
+																								$$->_type = static_cast<Node*>($2)->_type;
+																								$$->_place = get_reg_val(current_register_num);
+																								code_buffer.emit(initialize_reg_val(get_reg_val(current_register_num++), $$->_type, $$->_place));
+																								}
+;
+
+
+M_LABEL			:		{
+							$$ = new String(code_buffer.genLabel());
+						}
+
+
+CaseList 		:		CaseDecl CaseList 														{
+																									$$ = new Caselist();
+																									static_cast<Caselist*>($$)->_quad_list = static_cast<Caselist*>($2)->_quad_list;
+																									static_cast<Caselist*>($$)->_quad_list.push_back(static_cast<Case*>($1)->_quad);
+																									static_cast<Caselist*>($$)->_numeric_val_list = static_cast<Caselist*>($2)->_numeric_val_list;
+																									static_cast<Caselist*>($$)->_numeric_val_list.push_back(static_cast<Case*>($1)->_numeric_val);
+																									static_cast<Caselist*>($$)->_contains_break_list = static_cast<Caselist*>($2)->_contains_break_list;
+																									static_cast<Caselist*>($$)->_contains_break_list.push_back(static_cast<Case*>($1)->_contains_break);
+																									static_cast<Caselist*>($$)->_conds_next_lists = static_cast<Caselist*>($2)->_conds_next_lists;
+																									static_cast<Caselist*>($$)->_conds_next_lists.push_back(static_cast<Case*>($1)->next_list);
+																									$$->next_list = code_buffer.merge($1->next_list, $2->next_list);
+																									$$->continue_list = code_buffer.merge($1->continue_list, $2->continue_list);
+																									static_cast<Caselist*>($$)->_contains_default = static_cast<Case*>($1)->_is_default || static_cast<Caselist*>($2)->_contains_default;
+																								}
+
+
+				|		CaseDecl	                                                   			{
+																									$$ = new Caselist();
+																									static_cast<Caselist*>($$)->_quad_list.push_back(static_cast<Case*>($1)->_quad);
+																									static_cast<Caselist*>($$)->_numeric_val_list.push_back(static_cast<Case*>($1)->_numeric_val);
+																									static_cast<Caselist*>($$)->_contains_break_list.push_back(static_cast<Case*>($1)->_contains_break);
+																									static_cast<Caselist*>($$)->_conds_next_lists.push_back(static_cast<Case*>($1)->next_list);
+																									$$->next_list = $1->next_list;
+																									$$->continue_list = $1->continue_list;
+																								}
+
+
+				|		DEFAULT COLON M_LABEL Statements M_SWITCH_HELPER						{
+																									$$ = new Caselist();
+																									bool contains_break = false;																									
+																									if ($4->_statement_contains_break) { contains_break = true;}
+																									auto tmp_case = new Case(static_cast<String*>($3)->_value, 0, contains_break, true);
+																									tmp_case->next_list = $4->next_list;
+
+																									static_cast<Caselist*>($$)->_quad_list.push_back(tmp_case->_quad);
+																									static_cast<Caselist*>($$)->_numeric_val_list.push_back(tmp_case->_numeric_val);
+																									static_cast<Caselist*>($$)->_contains_break_list.push_back(tmp_case->_contains_break);																									
+																									// $$->next_list = $4->next_list;
+																									$$->next_list = code_buffer.merge($4->next_list, code_buffer.makelist({static_cast<Num*>($5)->_value, FIRST}));
+																									static_cast<Caselist*>($$)->_conds_next_lists.push_back($$->next_list); // probably unnessecary tho
+																									static_cast<Caselist*>($$)->_contains_default = true;
+																									$$->continue_list = $4->continue_list;
+																								}
+;
+
+
+CaseDecl		: 		CASE NUM COLON M_LABEL Statements M_SWITCH_HELPER						{																						
+																									bool contains_break = false;																									
+																									if ($5->_statement_contains_break) { contains_break = true;}
+																									$$ = new Case(static_cast<String*>($4)->_value, static_cast<Num*>($2)->_value, contains_break);
+																									$$->next_list = code_buffer.merge($5->next_list, code_buffer.makelist({static_cast<Num*>($6)->_value, FIRST}));
+																									$$->continue_list = $5->continue_list; 																					
+																								}				
+;
+
+
+M_SWITCH_HELPER 	:				{ 
+									    int current_loc = code_buffer.emit(create_uncond_branch());
+									    $$ = new Num(current_loc);		
+									}
+;
+
+%%
+
+// C user routines
+void yyerror (char const *message) 
+{
+   // std::cout << "DEBUG: detailed errorsyn: " << message << "\n";
+   output::errorSyn(yylineno);
+   exit(1);
+}
+
+
+std::string find_symbol_type(std::vector<SymbolTable>& table_stack, const std::string& name)
+{
+	std::string s("DOESNT_EXIST_TYPE");
+	for (std::vector<SymbolTable>::reverse_iterator it = table_stack.rbegin(); it != table_stack.rend(); ++it)
+	{
+		if (it -> contains_name(name))	{return it->get_table_entry(name)._type._basic_type;}
+	}
+	return s;
+}
+
+
+TableEntry get_function(std::vector<SymbolTable>& table_stack, const std::string& name)
+{
+	TableEntry t("NO_NAME");
+	for (std::vector<SymbolTable>::reverse_iterator it = table_stack.rbegin(); it != table_stack.rend(); ++it)
+	{
+		if (it -> contains_name(name))
+		{
+			if (it->get_table_entry(name)._is_func)	{ return it->get_table_entry(name);	}
+		}
+	}
+	return t;
+}
+
+
+TableEntry get_entry(std::vector<SymbolTable>& table_stack, const std::string& name)
+{
+	TableEntry t("NO_ENTRY");
+	for (std::vector<SymbolTable>::reverse_iterator it = table_stack.rbegin(); it != table_stack.rend(); ++it)
+	{
+		if (it -> contains_name(name)) { return it->get_table_entry(name);}
+	}
+	return t;
+}
+
+
+bool contains_symbol(std::vector<SymbolTable>& table_stack, const std::string& name)
+{
+	for (std::vector<SymbolTable>::reverse_iterator it = table_stack.rbegin(); it != table_stack.rend(); ++it)
+	{
+		if (it -> contains_name(name)) { return true;}
+	}
+	return false;
+}
+
+
+void print_end_scope(std::vector<SymbolTable>& table_stack)
+{
+	output::endScope();
+	SymbolTable stack_top_symtbl = table_stack.back();
+	
+	for (auto & it : stack_top_symtbl._symbol_entries)
+	{
+		if (!it._is_func) { output::printID(it._name, it._offset, it._type._basic_type);}
+		else
+		{
+			std::string func_type(output::makeFunctionType(it._type._return_type, it._type._args_types));
+			output::printID(it._name, it._offset, func_type);
+		}
+	} 
+}
+
+
+void print_all_scopes(std::vector<SymbolTable>& table_stack)
+{
+	std::cout << "Number of scopes: " << table_stack.size() << "\n";
+for (std::vector<SymbolTable>::reverse_iterator it = table_stack.rbegin(); it != table_stack.rend(); ++it)
+	{
+		for (auto & p : it->_symbol_entries)
+	{
+		if (!p._is_func) { output::printID(p._name, p._offset, p._type._basic_type);}
+		else
+		{
+			std::string func_type(output::makeFunctionType(p._type._return_type, p._type._args_types));
+			output::printID(p._name, p._offset, func_type);
+		}
+	}
+	}
+}
+
+
+std::vector<std::string> generate_entries_types(std::vector<TableEntry> entries)
+{
+	std::vector<std::string> result;
+	for (auto & entry : entries)
+	{
+		// regular entry
+		if (entry._type._basic_type != "FUNC")  { result.push_back(entry._type._basic_type); }
+		// entry representing function symbol
+		else 
+		{
+			std::string func_string(output::makeFunctionType(entry._type._return_type, entry._type._args_types));
+			result.push_back(func_string);
+		}
+	}
+	return result;
+}
+
+
+bool is_numeric(const std::string& type1, const std::string& type2)
+{
+	return ((type1 == "INT" && type2 == "INT") || (type1 == "BYTE" && type2 == "BYTE") || (type1 == "INT" && type2 == "BYTE") || (type1 == "BYTE" && type2 == "INT") || (type1 == "NUM" && type2 == "NUM") || (type1 == "NUM" && type2 == "INT") || (type1 == "NUM" && type2 == "BYTE") || (type1 == "BYTE" && type2 == "NUM") || (type1 == "INT" && type2 == "NUM"));
+}
+
+
+bool is_num(const std::string& type)
+{
+	return (type == "INT" || type == "BYTE" || type == "NUM");
+}
+
+// Returns the return type of the last function within the stack (current function scope)
+std::string get_func_return_type(std::vector<SymbolTable>& table_stack)
+{
+	std::string s("NO_FUNC");
+	for (std::vector<SymbolTable>::reverse_iterator it = table_stack.rbegin(); it != table_stack.rend(); ++it) 
+	{
+		if (it->get_curr_scope_ret_type() != "NO_FUNC") {return it->get_curr_scope_ret_type();}
+	}
+	return s;
+}
+
+
+bool is_in_while_scope(std::vector<SymbolTable>& table_stack)
+{
+	for (std::vector<SymbolTable>::reverse_iterator it = table_stack.rbegin(); it != table_stack.rend(); ++it) 
+	{
+		if (it->_scope_type == SCOPE_WHILE) {return true;}
+	}
+	return false;
+}
+
+
+bool is_in_switch_scope(std::vector<SymbolTable>& table_stack)
+{
+	for (std::vector<SymbolTable>::reverse_iterator it = table_stack.rbegin(); it != table_stack.rend(); ++it) 
+	{
+		if (it->_scope_type == SCOPE_SWITCH) {return true;}
+	}
+	return false;
+}
+
+
+bool is_legit_byte(int byte_val)
+{
+	return byte_val >= 0 && byte_val < 256;
+}
+
+
+int main()
+{
+	// yydebug = 1; // ENABLE DEBUGGING
+	int parsing_ret_code = yyparse();
+	code_buffer.printGlobalBuffer();
+	code_buffer.printCodeBuffer();
+	return parsing_ret_code;
+}
+
+
+// check this
+void emit_global_functions()
+{
+	// check this is emit and not emitGlobal
+	code_buffer.emit("declare i32 @printf(i8*, ...)");
+    code_buffer.emit("declare void @exit(i32)");
+	code_buffer.emit("@.int_specifier = constant [4 x i8] c\"%d\\0A\\00\"");
+	code_buffer.emit("@.str_specifier = constant [4 x i8] c\"%s\\0A\\00\"");
+	code_buffer.emit("\n");
+	code_buffer.emit("define void @printi(i32) {\n\t%spec_ptr = getelementptr [4 x i8], [4 x i8]* @.int_specifier, i32 0, i32 0\n\tcall i32 (i8*, ...) @printf(i8* %spec_ptr, i32 %0)\n\tret void\n}");
+	code_buffer.emit("define void @print(i8*) {\n\t%spec_ptr = getelementptr [4 x i8], [4 x i8]* @.str_specifier, i32 0, i32 0\n\tcall i32 (i8*, ...) @printf(i8* %spec_ptr, i8* %0)\n\tret void\n}");
+	code_buffer.emitGlobal("@.division_by_zero = constant [23 x i8] c\"Error division by zero\\00\"");
+}
+
+
+std::string print_function_retval(const std::string& type, const std::string& value)
+{
+	std::string result("ret ");
+	if (type == "VOID") { result += "void"; return result; }
+	else if (type == "BOOL") { result += "i1 ";}
+	else result += "i32 ";
+	if (value == "") {result += "0"; return result;}
+	else {result += "%" + value; return result;}
+}
+
+
+std::string create_func_signature(const std::string func_name, const std::string& ret_type, const std::vector<std::string>& args_types)
+{
+	std::string result("define ");
+	if (ret_type == "VOID") { result += "void @";}
+	else if (ret_type == "BOOL") { result += "i1 @";}
+	else result += "i32 @";
+	result += func_name + "(";
+	for (auto p = args_types.begin(); p != args_types.end(); p++)
+	{
+		if (*p == "VOID") {result += "i8*";}
+		else if (*p == "BOOL") {result += "i1";}
+		else {result += "i32";}
+		if (p != args_types.end() - 1) { result += ", ";}
+	}
+	result += ") {";
+	return result;
+}
+
+
+// check this - relative to the frame ptr!
+std::string create_alloca(uint32_t elements_count, const std::string& destination_ptr)
+{
+	std::string result("%");
+	result += destination_ptr + " = alloca i32, i32 " + to_string(elements_count);
+	return result;
+}
+
+
+std::string create_zext(const std::string& src, const std::string& dst, const std::string& type)
+{
+	std::string result("%" + dst + " = zext ");
+	if (type == "BOOL") {result += "i1 " + src + " to i32";}
+	else {result += "i8 " + src + " to i32";}
+	return result;
+}
+
+
+std::string create_store(const std::string& src, const std::string& dst)
+{
+	std::string result("store i32 %");
+	result += src + ", i32* %" + dst;
+	return result;
+}
+
+
+std::string convert_op(const std::string& op_char)
+{
+	switch(op_char[0])
+	{
+		case '=':  return "eq";
+		case '!':  return "ne";
+		case '+':  return "add";
+        case '-':  return "sub";
+        case '*':  return "mul";
+        case '/':  return "sdiv";
+        case '>':  if (op_char.size() != 2) return "sgt";
+		            else return "sge";
+		case '<':  if (op_char.size() != 2) return "slt";
+		           else return "sle";
+		default:   return "INVALID OPERATOR" + op_char;
+	}
+}
+
+
+std::string create_binop(const std::string& dst, const std::string& src_1, const std::string& src_2, const std::string& op_char)
+{
+	std::string result("%");
+	std::string op(convert_op(op_char));
+	result += dst + " = " + op + " i32 %" + src_1 + ", %" + src_2;
+	return result;
+}
+
+
+std::string initialize_reg_val(const std::string& dst, const std::string& type, const std::string& val)
+{
+	std::string result("%");
+	result += dst + " = add ";
+	if (type == "BOOL") { result += "i1 ";}
+	// else if (type == "BYTE") { result += "i8 ";} // CHECK THIS
+	else {result += "i32 ";}
+	result += "0, ";
+	if (val.front() == 'r') {result += "%";}
+	result += val; // check if the % is needed
+	return result;
+}
+
+
+// check this function
+void division_handler(Node* dst, Node* exp_1, Node* exp_2, const std::string& op_char)
+{
+	int divisor_register = current_register_num++;
+	code_buffer.emit(create_icmp(get_reg_val(divisor_register), exp_2->_place, "0"));
+	int cond_location = code_buffer.emit(create_cond_branch("@", "@", get_reg_val(divisor_register)));
+	auto zero_div_label = code_buffer.genLabel();
+	int division_error_register = current_register_num++;
+	std::string division_zero_error_inst("%" + get_reg_val(division_error_register) + " = getelementptr [23 x i8], [23 x i8]* @.division_by_zero, i8 0, i8 0");
+	std::string print_error_inst("call void @print(i8* %r" + to_string(division_error_register)+ ")");
+	std::string exit_inst("call void @exit(i32 0)");
+	code_buffer.emit(division_zero_error_inst);
+	code_buffer.emit(print_error_inst);
+	code_buffer.emit(exit_inst);
+	int legit_division_location = code_buffer.emit(create_uncond_branch());
+	auto legit_division_label = code_buffer.genLabel();
+	std::string dst_reg(get_reg_val(current_register_num));
+	int dst_reg_num = current_register_num++;
+	code_buffer.emit(create_binop(dst_reg, exp_1->_place, exp_2->_place, op_char));
+	int division_end_location = code_buffer.emit(create_uncond_branch());
+	std::string division_end_label(code_buffer.genLabel());
+	code_buffer.bpatch(code_buffer.makelist({cond_location, FIRST}), zero_div_label);
+	code_buffer.bpatch(code_buffer.makelist({cond_location, SECOND}), legit_division_label);
+	code_buffer.bpatch(code_buffer.makelist({legit_division_location, FIRST}), division_end_label);
+	code_buffer.bpatch(code_buffer.makelist({division_end_location, FIRST}), division_end_label);
+	if (dst->_type == "BYTE")  // check this
+	{
+		int trunc_register = current_register_num++;
+		code_buffer.emit(create_byte_trunc(get_reg_val(trunc_register), get_reg_val(dst_reg_num)));
+		dst->_place = get_reg_val(trunc_register);
+	}
+	else {dst->_place = get_reg_val(dst_reg_num);}
+}
+
+
+void do_binop(Node* dst, Node* exp_1, Node* exp_2, const std::string& op_char)
+{
+	if (exp_1->_type == "BYTE" && exp_2->_type == "BYTE") {	dst->_type="BYTE"; }
+	// at least one of them is integer
+	else { dst->_type="INT"; }
+	int tmp_reg = 0;
+	if (op_char == "+" || op_char == "-" || op_char == "*")
+	{
+		std::string dst_reg(get_reg_val(current_register_num));
+		tmp_reg = current_register_num++;
+		code_buffer.emit(create_binop(dst_reg, exp_1->_place, exp_2->_place, op_char));
+		dst->_place = get_reg_val(current_register_num++);
+		std::string helper_reg(get_reg_val(tmp_reg));
+		code_buffer.emit(initialize_reg_val(dst->_place, dst->_type, helper_reg));
+		if (dst->_type == "BYTE")  // should really check this
+		{
+			int trunc_register = current_register_num++;
+			code_buffer.emit(create_byte_trunc(get_reg_val(trunc_register), get_reg_val(tmp_reg)));
+			dst->_place = get_reg_val(trunc_register);
+		}
+	}
+	else if (op_char == "/")	{ division_handler(dst, exp_1, exp_2, op_char);	}
+}
+
+
+std::string create_load(const std::string& dst, const std::string& src)
+{
+	std::string result("%");
+	result += dst + " = load i32, i32* %" + src;
+    return result;
+}
+
+
+std::string create_bool_trunc(const std::string& reg, const std::string& src)
+{
+	std::string result("%");
+	result += reg + " = trunc i32 %" + src + " to i1";
+	return result;
+}
+
+
+std::string create_byte_trunc(const std::string& dst, const std::string& src)
+{
+	std::string result("%");
+	result += dst + " = and i32 %" + src + ", 255";
+	return result;
+}
+
+
+std::string create_cond_branch(const std::string& label_1, const std::string& label_2, const std::string& cond)
+{
+	std::string result("br i1 %");
+	result += cond + ", label " + label_1 + ", label " + label_2;
+	return result;
+}
+
+
+std::string create_uncond_branch(const std::string& label_1)
+{
+	std::string result("br label ");
+	if (label_1.compare("@")) { result += "%" + label_1; } 
+	else { result += label_1; }
+	return result;
+}
+
+
+std::string get_reg_val(int reg_num)
+{
+	std::string result("r" + to_string(reg_num));
+	return result;
+}
+
+
+std::string create_call(const std::string& func_name, const std::string& ret_type, const std::vector<std::string>& args_types, const std::vector<std::string>& args_place)
+{
+	std::string result("call ");
+	if (ret_type == "VOID") {result += "void ";}
+	else if (ret_type == "BOOL") {result += "i1 ";}
+	else {result += "i32 ";}
+	result += "@" + func_name + "(";
+	for (unsigned int i = 0 ; i < args_types.size() ; i++)
+	{
+		if (args_types[i] == "STRING") { result += "i8* ";}
+		else if (args_types[i] == "BOOL") { result += "i1 ";}
+		else result += "i32 "; // make sure no problem with bytes
+		result += "%" + args_place[i];
+		if (i != args_place.size() - 1) { result += ", ";}
+	}
+	result += ")";
+	return result;
+}
+
+
+std::string create_call(Func* inp_func)
+{
+	return create_call(inp_func->_value, inp_func->_ret_type, inp_func->_args_types, inp_func->_args_places);
+}
+
+
+std::string create_dst_call(const std::string& func_name, const std::string& ret_type, const std::vector<std::string>& args_types, const std::vector<std::string>& args_place, const std::string& dst)
+{
+	std::string result("%");
+	result += dst + " = " + create_call(func_name, ret_type, args_types, args_place);
+	return result;
+}
+
+
+std::string create_dst_call(Func* inp_func, const std::string& dst)
+{
+	return create_dst_call(inp_func->_value, inp_func->_ret_type, inp_func->_args_types, inp_func->_args_places, dst);
+}
+
+
+std::string create_icmp(const std::string& dst, const std::string& src, const std::string& value)
+{
+	std::string result("%");
+	result += dst + " = icmp eq i32 %" + src + ", " + value;
+	return result;
+}
+
+
+std::string create_icmp(const std::string& dst, const std::string& src_1, const std::string& src_2, const std::string& oper)
+{
+	std::string result("%");
+	result += dst + " = icmp " + oper + " i32 %" + src_1 + ", %" + src_2;
+	return result;
+}
+
+
+std::string create_oper(const std::string& op)
+{
+	if (op == "<") { return "slt";}
+	else if (op == "<=") { return "sle";}
+	else if (op == ">") { return "sgt";}
+	else if (op == ">=") { return "sge";}
+	else if (op == "+") { return "add";}
+	else if (op == "-") { return "sub";}
+	else if (op == "*") { return "mul";}
+	else if (op == "/") { return "sdiv";}
+	else if (op == "=") { return "eq";}
+	else if (op == "!") { return "neq";}
+	else {return "INVALID OP";}
+}
+
+
+std::string create_string(const std::string& str_name, const std::string& raw_bytes)
+{
+	std::string result("@.");
+	result += str_name + " = internal constant [" + to_string(raw_bytes.size() - 1) + " x i8] c" + raw_bytes;
+    result.pop_back();
+	result +="\\00\"";
+    return result;
+}
+
+
+std::string create_string(const std::string& dst_reg, const std::string& src_string, int string_size)
+{
+	std::string result("%");
+	result += dst_reg + " = getelementptr [" + to_string(string_size) + " x i8], [" + to_string (string_size) + " x i8]* @." + src_string + ", i32 0, i32 0";
+	return result;
+}
+
+
+std::string get_string_id_place(const std::vector<std::pair<std::string, std::string>>& ids_places, const std::string& input_str)
+{
+	std::string result("");
+	for (auto &p : ids_places)
+	{
+		if (0 == p.first.compare(input_str))
+		{
+			result = p.second;
+			break;
+		}
+	}
+	return result;
+}
+
+
+std::string create_ret(const std::string& ret_type, const std::string& ret_val)
+{
+	std::string result("ret ");
+	if ( ret_type == "VOID" ) { result += "void"; return result;}
+	else if ( ret_type == "BOOL" ) { result += "i1 "; }
+	else { result += "i32 "; }
+	if ( ret_val.size() == 0 ) { result += "0"; }
+	else { result += "%" + ret_val; }
+	return result;
+}
+
+
+void load_arguments(Func* func, const std::vector<std::string>& args_types, const std::vector<std::string>&  args_places)
+{
+	for (auto i = 0; i < args_types.size(); i++)
+	{
+		if (args_types[i] == "BOOL") { func->_contains_bool_arg = true;}
+		func->_args_types.push_back(args_types[i]);
+		func->_args_places.push_back(args_places[i]);
+	}
+}
+
+
+std::string create_boolean_phi(const std::string& dst, const std::string& label_1, const std::string& label_2)
+{
+	std::string result("%");
+	result += dst + " = phi i1 [1,%" + label_1;
+	result += "], [0,%" + label_2 + "]";
+	return result;
+}
+
+
+void emit_boolean_exp_bp(Node* exp_id, int curr_val)
+{
+	std::string false_label = code_buffer.genLabel();
+	code_buffer.bpatch(exp_id->false_list, false_label);
+	int false_location_end = code_buffer.emit(create_uncond_branch());
+	std::string true_label = code_buffer.genLabel();
+	code_buffer.bpatch(exp_id->true_list, true_label);
+	int true_location_end = code_buffer.emit(create_uncond_branch());
+	std::string curr_location_label = code_buffer.genLabel();
+	auto true_list = code_buffer.makelist({true_location_end, FIRST});
+	code_buffer.bpatch(true_list, curr_location_label);
+	auto false_list = code_buffer.makelist({false_location_end, FIRST});
+	code_buffer.bpatch(false_list, curr_location_label);
+	code_buffer.emit(create_boolean_phi(get_reg_val(curr_val), true_label, false_label));
+}
